@@ -63,6 +63,12 @@
     <button onclick="loadAnns()">刷新现行公告</button>
   </div>
   <div id="annMsg"></div>
+  <div class="row" style="margin-top:10px; border-top:1px dashed var(--bd); padding-top:10px">
+    <div class="field"><label>按编号校正旧库</label><input id="reconcileNo" placeholder="A001"></div>
+    <button onclick="reconcileAnn()">用接收流水恢复现行公告</button>
+  </div>
+  <p class="hint">校正以该编号已接纳的最高修订为准，正文取该版最早接纳的一次；只更新现行公告，读取流水期间新到的修订会一并计入，失败可重试。</p>
+  <div id="reconcileMsg"></div>
   <table id="annTable" style="display:none"><thead><tr>
     <th>编号</th><th>修订</th><th>生效日</th><th>旧股数</th><th>新股数</th><th>比例</th>
   </tr></thead><tbody></tbody></table>
@@ -157,6 +163,22 @@ async function importAnn() {
     show(el, "ok", `【${r.outcome}】${r.note}`);
     loadAnns();
   } catch (e) { show(el, "err", e.message); }
+}
+async function reconcileAnn() {
+  const el = document.getElementById("reconcileMsg");
+  const no = document.getElementById("reconcileNo").value.trim();
+  if (!no) { show(el, "err", "请填写公告编号"); return; }
+  try {
+    const r = await api("/api/announcements/" + encodeURIComponent(no) + "/reconcile", {
+      method: "POST"
+    });
+    const kind = (r.action === "unchanged" || r.action === "no_source") ? "warn" : "ok";
+    show(el, kind, `【${r.action}】${r.note}`
+      + (r.after_revision != null ? `\n恢复后现行修订：第 ${r.after_revision} 版`
+         + `（此前：${r.before_revision == null ? "无" : "第 " + r.before_revision + " 版"}）` : "")
+      + (r.newly_accepted ? `\n读取旧流水期间新接纳并计入 ${r.newly_accepted} 个修订。` : ""));
+    loadAnns();
+  } catch (e) { show(el, "err", e.message + "\n可重试。"); }
 }
 async function loadAnns() {
   const { announcements } = await api("/api/announcements");

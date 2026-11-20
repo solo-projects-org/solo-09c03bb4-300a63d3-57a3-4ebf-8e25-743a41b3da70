@@ -5,6 +5,7 @@
                    送审与更正均共用此底表，不复制行情。
 - announcements    公告现行版本（每号一行，只保留最高修订）。
 - announcements_log 公告收发流水，用于审计与“原样重送沿用 / 异文退回”。
+- reconciliation_log 公告旧库校正流水（按编号从接收流水恢复现行公告）。
 - submissions      锁定送审记录（区间、基准日、依据指纹）。
 - submission_basis 每次送审重算所需的公告依据快照（只留依据，不留行情副本）。
 """
@@ -50,6 +51,19 @@ CREATE TABLE IF NOT EXISTS announcements_log (
     received_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS reconciliation_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ann_no       TEXT NOT NULL,
+    before_revision    INTEGER,
+    before_body_hash   TEXT,
+    after_revision     INTEGER,
+    after_body_hash    TEXT,
+    source_log_id      INTEGER,
+    action       TEXT NOT NULL,
+    note         TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS submissions (
     submission_id TEXT PRIMARY KEY,
     start_date    TEXT NOT NULL,
@@ -72,6 +86,7 @@ CREATE TABLE IF NOT EXISTS submission_basis (
 
 CREATE INDEX IF NOT EXISTS idx_prices_date ON prices(trade_date);
 CREATE INDEX IF NOT EXISTS idx_ann_eff ON announcements(effective_date);
+CREATE INDEX IF NOT EXISTS idx_ann_log_no ON announcements_log(ann_no, revision, id);
 """
 
 
@@ -83,9 +98,11 @@ def get_connection(db_path: str | None = None) -> sqlite3.Connection:
     path = db_path or get_db_path()
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    # 并发导入/校正时写锁按序等待，而不是立即报 database is locked。
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
 
 

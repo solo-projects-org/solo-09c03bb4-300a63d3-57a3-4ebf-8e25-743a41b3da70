@@ -11,7 +11,6 @@ from pydantic import BaseModel, Field
 
 from app.db import db_cursor, init_db
 from app.models import (
-    AdjustedPoint,
     AnnouncementIn,
     AnnouncementResult,
     LockInRequest,
@@ -19,6 +18,7 @@ from app.models import (
     PreviewResult,
     PriceImportResult,
     PriceIn,
+    ReconcileResult,
     ReopenResult,
 )
 from app.services import (
@@ -125,25 +125,93 @@ def _current_announcements(conn) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _accepted_versions(conn, ann_no: str) -> dict[int, dict]:
+    """该编号接收流水里已接纳的全部版本：每版取最早接纳的那一次。
+
+    只认 inserted/updated/reused（rejected_* 是退回，不算接纳）。同一修订号若因
+    交错导入出现了两条不同正文的接纳记录，以流水 id 最小（最早接纳）的为准，
+    保证“同号同版异文”判定不受到达顺序影响。
+    """
+    rows = conn.execute(
+        "SELECT id, revision, effective_date, old_shares, new_shares, body_hash,"
+        " outcome, received_at FROM announcements_log"
+        " WHERE ann_no=? AND outcome IN ('inserted','updated','reused')"
+        " ORDER BY id",
+        (ann_no,),
+    ).fetchall()
+    accepted: dict[int, dict] = {}
+    for row in rows:
+        accepted.setdefault(int(row["revision"]), dict(row))
+    return accepted
+
+
+def _effective_accepted(conn, ann_no: str) -> dict[int, dict]:
+    """已接纳版本全集 = 接收流水 ∪ 现行公告。
+
+    现行表若有一条流水里没有的修订（旧库/人工预置），也应视为已接纳，
+    否则迟到的低修订会把它覆盖掉、校正也会把它误降级；同一修订号两者都有时，
+    正文以流水里最早接纳的那一次为准（现行表若被旧 bug 改坏，交给按号校正修复）。
+    """
+    accepted = _accepted_versions(conn, ann_no)
+    row = conn.execute(
+        "SELECT revision, effective_date, old_shares, new_shares, body_hash"
+        " FROM announcements WHERE ann_no=?",
+        (ann_no,),
+    ).fetchone()
+    if row is not None:
+        rev = int(row["revision"])
+        accepted.setdefault(rev, {
+            "id": None, "revision": rev, "effective_date": row["effective_date"],
+            "old_shares": int(row["old_shares"]),
+            "new_shares": int(row["new_shares"]), "body_hash": row["body_hash"],
+        })
+    return accepted
+
+
+def _log_rejection(conn, ann: AnnouncementIn, digest: str,
+                   outcome: str, note: str, status_code: int,
+                   detail: str) -> None:
+    """退回也要留审计流水：先提交流水再抛错，避免被事务回滚吞掉。"""
+    conn.execute(
+        "INSERT INTO announcements_log(ann_no, revision, effective_date,"
+        " old_shares, new_shares, body_hash, outcome, note)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (ann.ann_no, ann.revision, ann.effective_date, ann.old_shares,
+         ann.new_shares, digest, outcome, note),
+    )
+    conn.commit()
+    raise HTTPException(status_code=status_code, detail=detail)
+
+
 @app.post("/api/announcements/import", response_model=AnnouncementResult)
 def import_announcement(ann: AnnouncementIn):
-    """公告收发规则：
+    """公告收发规则（以该编号已接纳的最高修订为准）：
 
-    - 同号同版原样重送（正文哈希一致）→ 沿用原公告，记 reused；
-    - 同号同版异文重送 → 退回 409，记 rejected_diff；
-    - 更高修订 → 更正现行版本，记 updated（旧版仅留流水，现行表只留最高修订）；
-    - 修订号低于现行 → 退回 422，记 rejected_old。
+    - 修订号低于已接纳的最高修订 → 退回 422，记 rejected_old（即便它比现行表里的
+      版本高也不得覆盖；交错的低修订不能盖掉高修订）；
+    - 等于最高修订：正文与该版最早接纳的正文一致 → reused 沿用；
+      正文不同 → 409 退回，记 rejected_diff（同版异文永远不会被当成更正）；
+    - 高于最高修订 → 更正现行版本，记 updated/inserted（旧版仅留流水）。
     """
     payload = ann.model_dump()
     digest = body_hash_of(payload)
     with db_cursor() as conn:
-        row = conn.execute(
-            "SELECT revision, body_hash FROM announcements WHERE ann_no=?",
-            (ann.ann_no,),
-        ).fetchone()
+        # 写事务先取锁，避免两个并发导入各自读到旧状态后互相覆盖。
+        conn.execute("BEGIN IMMEDIATE")
+        accepted = _effective_accepted(conn, ann.ann_no)
+        highest_rev = max(accepted) if accepted else None
+        current = accepted.get(highest_rev) if highest_rev is not None else None
 
-        if row is not None and ann.revision == row["revision"]:
-            if digest == row["body_hash"]:
+        if highest_rev is not None and ann.revision < highest_rev:
+            _log_rejection(
+                conn, ann, digest, "rejected_old",
+                "修订号低于已接纳的最高修订，退回", 422,
+                f"公告 {ann.ann_no} 已接纳的最高修订为第 {highest_rev} 版，"
+                f"收到第 {ann.revision} 版（更低），退回",
+            )
+
+        if current is not None and ann.revision == highest_rev:
+            if digest == current["body_hash"]:
                 conn.execute(
                     "INSERT INTO announcements_log(ann_no, revision, effective_date,"
                     " old_shares, new_shares, body_hash, outcome, note)"
@@ -153,34 +221,14 @@ def import_announcement(ann: AnnouncementIn):
                 )
                 return AnnouncementResult(**payload, outcome="reused",
                                           note="同号同版原样重送，沿用原公告")
-            conn.execute(
-                "INSERT INTO announcements_log(ann_no, revision, effective_date,"
-                " old_shares, new_shares, body_hash, outcome, note)"
-                " VALUES (?,?,?,?,?,?, 'rejected_diff', '同号同版异文，退回')",
-                (ann.ann_no, ann.revision, ann.effective_date, ann.old_shares,
-                 ann.new_shares, digest),
-            )
-            raise HTTPException(
-                status_code=409,
-                detail=f"公告 {ann.ann_no} 第 {ann.revision} 版已存在且正文不同，异文退回",
+            _log_rejection(
+                conn, ann, digest, "rejected_diff",
+                "同号同版异文，退回", 409,
+                f"公告 {ann.ann_no} 第 {ann.revision} 版已接纳且正文不同，异文退回",
             )
 
-        if row is not None and ann.revision < row["revision"]:
-            conn.execute(
-                "INSERT INTO announcements_log(ann_no, revision, effective_date,"
-                " old_shares, new_shares, body_hash, outcome, note)"
-                " VALUES (?,?,?,?,?,?, 'rejected_old', '修订号低于现行最高修订，退回')",
-                (ann.ann_no, ann.revision, ann.effective_date, ann.old_shares,
-                 ann.new_shares, digest),
-            )
-            raise HTTPException(
-                status_code=422,
-                detail=f"公告 {ann.ann_no} 现行修订为第 {row['revision']} 版，"
-                       f"收到第 {ann.revision} 版（更低），退回",
-            )
-
-        outcome = "inserted" if row is None else "updated"
-        note = "首次导入" if row is None else f"更高修订，替代第 {row['revision']} 版"
+        outcome = "inserted" if current is None else "updated"
+        note = "首次导入" if current is None else f"更高修订，替代第 {highest_rev} 版"
         conn.execute(
             "INSERT INTO announcements(ann_no, revision, effective_date, old_shares,"
             " new_shares, body_hash) VALUES (?,?,?,?,?,?)"
@@ -205,6 +253,110 @@ def list_announcements():
     with db_cursor() as conn:
         anns = _current_announcements(conn)
     return {"announcements": anns}
+
+
+# ------------------------------------------------------------ 旧库按号校正
+
+def _restore_target(accepted: dict[int, dict]) -> dict | None:
+    """按规则给出应恢复的现行版本：已接纳的最高修订，正文取该版最早接纳的一次。"""
+    if not accepted:
+        return None
+    highest = max(accepted)
+    return accepted[highest]
+
+
+def _reconcile_one(conn, ann_no: str) -> dict:
+    """校正一个编号的现行公告。调用方负责事务边界与写锁。
+
+    目标版本从“流水 ∪ 现行表”里取最高修订（现行表里已存在、流水缺记的版本
+    仍算已接纳，避免把合法的高版本误降级）；正文以流水里该版最早接纳的为准。
+    """
+    accepted = _effective_accepted(conn, ann_no)
+    target = _restore_target(accepted)
+    if target is None:
+        return {"ann_no": ann_no, "action": "no_source",
+                "note": "接收流水无已接纳版本，保持现行公告不变",
+                "before_revision": None, "after_revision": None, "newly_accepted": 0}
+
+    current = conn.execute(
+        "SELECT revision, effective_date, old_shares, new_shares, body_hash"
+        " FROM announcements WHERE ann_no=?",
+        (ann_no,),
+    ).fetchone()
+
+    if current is not None and current["body_hash"] == target["body_hash"] \
+            and int(current["revision"]) == int(target["revision"]):
+        action = "unchanged"
+        note = "现行公告已符合接收流水规则，无需改动"
+    elif current is None:
+        action = "restored"
+        note = "现行公告缺失，按接收流水恢复"
+    else:
+        action = "corrected"
+        note = (f"按接收流水恢复为第 {target['revision']} 版"
+                f"（原为第 {current['revision']} 版）")
+
+    if action != "unchanged":
+        conn.execute(
+            "INSERT INTO announcements(ann_no, revision, effective_date, old_shares,"
+            " new_shares, body_hash) VALUES (?,?,?,?,?,?)"
+            " ON CONFLICT(ann_no) DO UPDATE SET revision=excluded.revision,"
+            " effective_date=excluded.effective_date, old_shares=excluded.old_shares,"
+            " new_shares=excluded.new_shares, body_hash=excluded.body_hash",
+            (ann_no, target["revision"], target["effective_date"],
+             target["old_shares"], target["new_shares"], target["body_hash"]),
+        )
+    conn.execute(
+        "INSERT INTO reconciliation_log(ann_no, before_revision, before_body_hash,"
+        " after_revision, after_body_hash, source_log_id, action, note)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (ann_no,
+         None if current is None else int(current["revision"]),
+         None if current is None else current["body_hash"],
+         int(target["revision"]), target["body_hash"],
+         None if target.get("id") is None else int(target["id"]),
+         action, note),
+    )
+    return {
+        "ann_no": ann_no,
+        "action": action,
+        "note": note,
+        "revision": int(target["revision"]),
+        "effective_date": target["effective_date"],
+        "old_shares": int(target["old_shares"]),
+        "new_shares": int(target["new_shares"]),
+        "before_revision": None if current is None else int(current["revision"]),
+        "after_revision": int(target["revision"]),
+        "source_log_id": None if target.get("id") is None else int(target["id"]),
+    }
+
+
+def _reconcile_announcement(ann_no: str) -> dict:
+    """按编号校正旧库：先读接收流水（不持写锁，期间仍可导入），
+    再在写事务里重读流水，把读取期间新接纳的修订一并计入，只更新现行公告。
+
+    失败时整笔事务回滚，此前已提交的现行公告原样保留，可重复调用重试。
+    """
+    with db_cursor() as conn:
+        before = _effective_accepted(conn, ann_no)
+        before_ids = {int(v["id"]) for v in before.values() if v.get("id") is not None}
+
+    with db_cursor() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        after = _effective_accepted(conn, ann_no)
+        result = _reconcile_one(conn, ann_no)
+        new_ids = {int(v["id"]) for v in after.values() if v.get("id") is not None}
+        result["newly_accepted"] = len(new_ids - before_ids)
+        if result["newly_accepted"]:
+            result["note"] += (f"；读取旧流水期间又接纳 {result['newly_accepted']} 个修订，"
+                               "已一并计入")
+        return result
+
+
+@app.post("/api/announcements/{ann_no}/reconcile", response_model=ReconcileResult)
+def reconcile_announcement(ann_no: str):
+    """按公告编号，用接收流水恢复符合规则的现行公告（可重试、只动现行公告）。"""
+    return _reconcile_announcement(ann_no)
 
 
 # ---------------------------------------------------------------- 预览/送审

@@ -85,6 +85,20 @@ class LockInResult(BaseModel):
     points: list[AdjustedPoint]
 
 
+class ReconcileResult(BaseModel):
+    ann_no: str
+    action: str = Field(description="corrected/restored/unchanged/no_source")
+    note: str
+    revision: int | None = None
+    effective_date: str | None = None
+    old_shares: int | None = None
+    new_shares: int | None = None
+    before_revision: int | None = None
+    after_revision: int | None = None
+    source_log_id: int | None = None
+    newly_accepted: int = Field(default=0, description="读取旧流水期间新接纳并计入的修订数")
+
+
 class ReopenResult(BaseModel):
     submission_id: str
     start_date: str

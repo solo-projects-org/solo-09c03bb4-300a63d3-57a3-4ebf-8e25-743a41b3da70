@@ -1,5 +1,6 @@
 """端到端自测：覆盖基准日前后折算、拆/并股、四舍五入、同版重送幂等、
-异文退回、公告更正后凭送审号重现、重启持久化。"""
+异文退回、公告更正后凭送审号重现、重启持久化、同号公告交错导入、
+按编号用接收流水校正旧库（含读取期间并发导入与失败重试）。"""
 from __future__ import annotations
 
 import importlib
@@ -313,3 +314,369 @@ def test_validation_errors(client):
     bad = c.post("/api/prices/import",
                  json={"prices": [{"trade_date": "2026/01/05", "close_cents": 1}]})
     assert bad.status_code == 422
+
+
+# ---------------------------------------------------------- 同号拆并股公告：交错导入
+
+def _anns_by_no(c):
+    return {a["ann_no"]: a for a in c.get("/api/announcements").json()["announcements"]}
+
+
+def _log(c, db_path):
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM announcements_log ORDER BY id").fetchall()]
+    finally:
+        conn.close()
+
+
+def test_interleaved_low_revision_cannot_overwrite_high(client):
+    """两版同号公告交错到达：迟到的第 1 版不得盖掉已接纳的第 2 版。"""
+    c, db_path = client
+    _import_prices(c, [("2026-01-05", 1000), ("2026-01-12", 2000)])
+    high = _ann(c, ann_no="S1", revision=2, effective_date="2026-01-10",
+                old_shares=1, new_shares=4)
+    assert high.status_code == 200 and high.json()["outcome"] == "inserted"
+    low = _ann(c, ann_no="S1", revision=1, effective_date="2026-01-10",
+               old_shares=1, new_shares=2)
+    assert low.status_code == 422
+    cur = _anns_by_no(c)["S1"]
+    assert cur["revision"] == 2 and cur["new_shares"] == 4
+    outcomes = [(r["revision"], r["outcome"]) for r in _log(c, db_path)]
+    assert outcomes == [(2, "inserted"), (1, "rejected_old")]
+    # 网页预览按第 2 版（1:4）折算，而非迟到的第 1 版（1:2）
+    pv = c.get("/api/adjustments/preview", params={
+        "start_date": "2026-01-05", "end_date": "2026-01-12",
+        "base_date": "2026-01-12"}).json()
+    assert {p["trade_date"]: p["adjusted_cents"] for p in pv["points"]}[
+        "2026-01-05"] == 250
+
+
+def test_interleaved_same_revision_diff_body_is_not_a_correction(client):
+    """同版异文（交错到达）不得被当成更正：沿用最早接纳的正文，异文退回。"""
+    c, _ = client
+    _import_prices(c, [("2026-01-05", 1000), ("2026-01-12", 2000)])
+    first = _ann(c, ann_no="S2", revision=1, effective_date="2026-01-10",
+                 old_shares=1, new_shares=2)
+    assert first.json()["outcome"] == "inserted"
+    # 同一修订号的另一份正文（例如来自另一路的重复投递）
+    diff = _ann(c, ann_no="S2", revision=1, effective_date="2026-01-10",
+                old_shares=1, new_shares=3)
+    assert diff.status_code == 409
+    cur = _anns_by_no(c)["S2"]
+    assert cur["new_shares"] == 2
+    # 最早接纳的正文原样重送仍沿用
+    same = _ann(c, ann_no="S2", revision=1, effective_date="2026-01-10",
+                old_shares=1, new_shares=2)
+    assert same.status_code == 200 and same.json()["outcome"] == "reused"
+    pv = c.get("/api/adjustments/preview", params={
+        "start_date": "2026-01-05", "end_date": "2026-01-12",
+        "base_date": "2026-01-12"}).json()
+    assert pv["points"][0]["adjusted_cents"] == 500  # 1:2，而非异文的 1:3
+
+
+def test_high_revision_arrives_after_low_still_updates(client):
+    c, _ = client
+    assert _ann(c, ann_no="S3", revision=1, effective_date="2026-01-10",
+                old_shares=1, new_shares=2).json()["outcome"] == "inserted"
+    upd = _ann(c, ann_no="S3", revision=3, effective_date="2026-01-10",
+               old_shares=1, new_shares=5)
+    assert upd.status_code == 200 and upd.json()["outcome"] == "updated"
+    assert _anns_by_no(c)["S3"]["revision"] == 3
+    # 介于两者之间的第 2 版仍算低修订
+    assert _ann(c, ann_no="S3", revision=2, effective_date="2026-01-10",
+                old_shares=1, new_shares=4).status_code == 422
+
+
+# ---------------------------------------------------------- 按号校正旧库
+
+def _corrupt_current(db_path, ann_no, revision, old_shares, new_shares,
+                     effective_date="2026-01-10"):
+    """模拟旧库里的错误现行公告（例如被迟到的低修订覆盖过）。"""
+    import sqlite3
+    from app.services import body_hash_of
+    digest = body_hash_of({"revision": revision, "effective_date": effective_date,
+                           "old_shares": old_shares, "new_shares": new_shares})
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE announcements SET revision=?, effective_date=?, old_shares=?,"
+            " new_shares=?, body_hash=? WHERE ann_no=?",
+            (revision, effective_date, old_shares, new_shares, digest, ann_no))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_reconcile_restores_highest_revision_and_earliest_body(client):
+    c, db_path = client
+    _import_prices(c, [("2026-01-05", 1000), ("2026-01-12", 2000)])
+    _ann(c, ann_no="R1", revision=1, effective_date="2026-01-10",
+         old_shares=1, new_shares=2)
+    _ann(c, ann_no="R1", revision=2, effective_date="2026-01-10",
+         old_shares=1, new_shares=4)
+    # 旧库里现行公告被第 1 版覆盖
+    _corrupt_current(db_path, "R1", 1, 1, 2)
+    assert _anns_by_no(c)["R1"]["revision"] == 1
+
+    rec = c.post("/api/announcements/R1/reconcile")
+    assert rec.status_code == 200, rec.text
+    body = rec.json()
+    assert body["action"] == "corrected" and body["after_revision"] == 2
+    assert body["before_revision"] == 1 and body["newly_accepted"] == 0
+    cur = _anns_by_no(c)["R1"]
+    assert cur["revision"] == 2 and cur["new_shares"] == 4
+    # 校正只更新现行公告，不新增、不删除接收流水
+    assert len(_log(c, db_path)) == 2
+    # 校正后的预览按第 2 版折算
+    pv = c.get("/api/adjustments/preview", params={
+        "start_date": "2026-01-05", "end_date": "2026-01-12",
+        "base_date": "2026-01-12"}).json()
+    assert pv["points"][0]["adjusted_cents"] == 250
+    # 再跑一次为幂等 unchanged，可从任何状态重试
+    again = c.post("/api/announcements/R1/reconcile").json()
+    assert again["action"] == "unchanged"
+
+
+def test_reconcile_uses_earliest_accepted_body_for_same_revision(client):
+    """旧库里同版异文被错当成更正时，校正取该版最早接纳的正文。"""
+    c, db_path = client
+    from app.services import body_hash_of
+    import sqlite3
+    # 直接构造旧库流水：第 2 版先接纳 1→4，后又有一条“更正”成 1→9
+    first_hash = body_hash_of({"revision": 2, "effective_date": "2026-01-10",
+                               "old_shares": 1, "new_shares": 4})
+    nine_hash = body_hash_of({"revision": 2, "effective_date": "2026-01-10",
+                              "old_shares": 1, "new_shares": 9})
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO announcements(ann_no, revision, effective_date,"
+            " old_shares, new_shares, body_hash) VALUES"
+            " ('L1', 1, '2026-01-10', 1, 2, ?)",
+            (body_hash_of({"revision": 1, "effective_date": "2026-01-10",
+                           "old_shares": 1, "new_shares": 2}),))
+        for rev, hash_, old, new, outcome in [
+            (1, body_hash_of({"revision": 1, "effective_date": "2026-01-10",
+                              "old_shares": 1, "new_shares": 2}), 1, 2, "inserted"),
+            (2, first_hash, 1, 4, "updated"),
+            (2, nine_hash, 1, 9, "updated"),  # 旧实现的“同版异文当更正”
+        ]:
+            conn.execute(
+                "INSERT INTO announcements_log(ann_no, revision, effective_date,"
+                " old_shares, new_shares, body_hash, outcome)"
+                " VALUES ('L1',?,?,?,?,?,?)",
+                (rev, "2026-01-10", old, new, hash_, outcome))
+        conn.execute(
+            "UPDATE announcements SET revision=2, old_shares=1, new_shares=9,"
+            " body_hash=? WHERE ann_no='L1'", (nine_hash,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    rec = c.post("/api/announcements/L1/reconcile").json()
+    assert rec["action"] == "corrected"
+    assert rec["source_log_id"] is not None
+    cur = _anns_by_no(c)["L1"]
+    assert cur["revision"] == 2 and cur["new_shares"] == 4  # 最早接纳的正文
+
+
+def test_reconcile_counts_revisions_accepted_while_reading_log(client, monkeypatch):
+    """读取旧流水期间仍可导入；校正生效时把期间已接纳的修订计入。"""
+    c, db_path = client
+    _import_prices(c, [("2026-01-05", 1000), ("2026-01-12", 2000)])
+    _ann(c, ann_no="C1", revision=1, effective_date="2026-01-10",
+         old_shares=1, new_shares=2)
+    _corrupt_current(db_path, "C1", 1, 1, 2)
+
+    import app.main as main
+
+    original = main._effective_accepted
+    calls = {"n": 0}
+
+    def racing(conn, ann_no):
+        result = original(conn, ann_no)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # 模拟校正“读旧流水”与“写现行”之间到达的新修订（另一连接已提交）
+            import sqlite3
+            from app.services import body_hash_of as bh
+            other = sqlite3.connect(db_path, timeout=10)
+            try:
+                other.execute(
+                    "INSERT INTO announcements(ann_no, revision, effective_date,"
+                    " old_shares, new_shares, body_hash) VALUES"
+                    " ('C1', 3, '2026-01-10', 1, 8, ?)"
+                    " ON CONFLICT(ann_no) DO UPDATE SET revision=excluded.revision,"
+                    " old_shares=excluded.old_shares,"
+                    " new_shares=excluded.new_shares, body_hash=excluded.body_hash",
+                    (bh({"revision": 3, "effective_date": "2026-01-10",
+                         "old_shares": 1, "new_shares": 8}),))
+                other.execute(
+                    "INSERT INTO announcements_log(ann_no, revision, effective_date,"
+                    " old_shares, new_shares, body_hash, outcome)"
+                    " VALUES ('C1', 3, '2026-01-10', 1, 8, ?, 'updated')",
+                    (bh({"revision": 3, "effective_date": "2026-01-10",
+                         "old_shares": 1, "new_shares": 8}),))
+                other.commit()
+            finally:
+                other.close()
+        return result
+
+    monkeypatch.setattr(main, "_effective_accepted", racing)
+    rec = c.post("/api/announcements/C1/reconcile").json()
+    assert rec["newly_accepted"] == 1
+    assert rec["after_revision"] == 3
+    assert _anns_by_no(c)["C1"]["new_shares"] == 8
+
+
+def test_reconcile_failure_keeps_previous_announcement_and_retries(client, monkeypatch):
+    c, db_path = client
+    _import_prices(c, [("2026-01-05", 1000), ("2026-01-12", 2000)])
+    _ann(c, ann_no="F1", revision=2, effective_date="2026-01-10",
+         old_shares=1, new_shares=4)
+    _corrupt_current(db_path, "F1", 1, 1, 2)
+
+    import app.main as main
+    original = main._reconcile_one
+    boom = {"on": True}
+
+    def flaky(conn, ann_no):
+        if boom["on"]:
+            raise RuntimeError("模拟校正写入失败")
+        return original(conn, ann_no)
+
+    monkeypatch.setattr(main, "_reconcile_one", flaky)
+    with pytest.raises(RuntimeError):
+        c.post("/api/announcements/F1/reconcile")
+    # 失败时现行公告保持此前已提交的状态（旧库里的第 1 版）
+    assert _anns_by_no(c)["F1"]["revision"] == 1
+
+    boom["on"] = False
+    rec = c.post("/api/announcements/F1/reconcile")
+    assert rec.status_code == 200 and rec.json()["action"] == "corrected"
+    assert _anns_by_no(c)["F1"]["revision"] == 2
+
+
+def test_reconcile_does_not_touch_other_announcements_or_submissions(client):
+    c, db_path = client
+    _import_prices(c, [("2026-01-05", 1000), ("2026-01-12", 2000)])
+    _ann(c, ann_no="K1", revision=1, effective_date="2026-01-10",
+         old_shares=1, new_shares=2)
+    pv = c.get("/api/adjustments/preview", params={
+        "start_date": "2026-01-05", "end_date": "2026-01-12",
+        "base_date": "2026-01-12"}).json()
+    sub = c.post("/api/submissions", json={
+        "start_date": "2026-01-05", "end_date": "2026-01-12",
+        "base_date": "2026-01-12", "basis_hash": pv["basis_hash"]}).json()
+    original_points = sub["points"]
+    _corrupt_current(db_path, "K1", 1, 1, 4)  # 仅改现行表，流水仍是 1:2
+
+    c.post("/api/announcements/K1/reconcile")
+    assert _anns_by_no(c)["K1"]["new_shares"] == 2  # 按流水恢复成 1:2
+    # 已发出的送审号仍用原先留存的依据重开
+    reopened = c.get(f"/api/submissions/{sub['submission_id']}").json()
+    assert reopened["points"] == original_points
+    assert reopened["stale"] is False
+
+
+def test_reconcile_unknown_number_is_noop(client):
+    c, _ = client
+    rec = c.post("/api/announcements/NOPE/reconcile").json()
+    assert rec["action"] == "no_source"
+    assert c.get("/api/announcements").json()["announcements"] == []
+
+
+def test_truly_concurrent_interleaved_imports_converge(client):
+    """多线程同时投递同号不同修订，不论落库顺序，最终都收敛到最高修订。"""
+    c, db_path = client
+    _import_prices(c, [("2026-01-05", 1000), ("2026-01-12", 2000)])
+    from concurrent.futures import ThreadPoolExecutor
+    versions = [(1, 1, 2), (2, 1, 4), (3, 1, 5)]
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futs = [pool.submit(_ann, c, ann_no="T1", revision=r,
+                            effective_date="2026-01-10",
+                            old_shares=o, new_shares=n)
+                for r, o, n in versions for _ in range(2)]
+        results = [f.result() for f in futs]
+    assert any(r.status_code == 200 for r in results)
+    cur = _anns_by_no(c)["T1"]
+    assert cur["revision"] == 3 and cur["new_shares"] == 5
+    # 低修订一条也没被接纳
+    accepted_revs = {r["revision"] for r in _log(c, db_path)
+                     if r["outcome"] in ("inserted", "updated", "reused")}
+    assert accepted_revs <= {3} or max(accepted_revs) == 3
+    # 同号同版原样重送仍沿用
+    again = _ann(c, ann_no="T1", revision=3, effective_date="2026-01-10",
+                 old_shares=1, new_shares=5)
+    assert again.json()["outcome"] == "reused"
+
+
+def test_concurrent_reconcile_and_new_revision_import(client):
+    """校正与导入并发：校正计入期间已接纳的修订，导入不被校正挡住。"""
+    c, db_path = client
+    _import_prices(c, [("2026-01-05", 1000), ("2026-01-12", 2000)])
+    _ann(c, ann_no="P1", revision=2, effective_date="2026-01-10",
+         old_shares=1, new_shares=2)
+    _corrupt_current(db_path, "P1", 1, 1, 4)
+
+    import app.main as main
+    original = main._effective_accepted
+    state = {"fired": False}
+
+    def slow_first_read(conn, ann_no):
+        result = original(conn, ann_no)
+        if not state["fired"]:
+            state["fired"] = True
+            # 读取旧流水期间，新修订经另一请求到达
+            resp = _ann(c, ann_no="P1", revision=5, effective_date="2026-01-10",
+                        old_shares=1, new_shares=6)
+            assert resp.status_code == 200 and resp.json()["outcome"] == "updated"
+        return result
+
+    main._effective_accepted = slow_first_read
+    try:
+        rec = c.post("/api/announcements/P1/reconcile").json()
+    finally:
+        main._effective_accepted = original
+    assert rec["newly_accepted"] == 1
+    assert rec["after_revision"] == 5
+    assert _anns_by_no(c)["P1"]["new_shares"] == 6
+    # 期间到达的那次导入没有被校正回退
+    logs = _log(c, db_path)
+    assert any(r["revision"] == 5 and r["outcome"] == "updated" for r in logs)
+    assert logs[-1]["outcome"] != "rejected_old"
+
+
+def test_reconcile_never_downgrades_revision_only_present_in_current_table(client):
+    """旧库中现行表有流水缺记的高修订时，校正不得把它降级。"""
+    c, db_path = client
+    import sqlite3
+    from app.services import body_hash_of
+
+    high_hash = body_hash_of({"revision": 3, "effective_date": "2026-01-10",
+                              "old_shares": 1, "new_shares": 8})
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO announcements(ann_no, revision, effective_date,"
+            " old_shares, new_shares, body_hash) VALUES ('G1', 3, '2026-01-10', 1, 8, ?)",
+            (high_hash,))
+        conn.execute(
+            "INSERT INTO announcements_log(ann_no, revision, effective_date,"
+            " old_shares, new_shares, body_hash, outcome)"
+            " VALUES ('G1', 1, '2026-01-10', 1, 2, ?, 'inserted')",
+            (body_hash_of({"revision": 1, "effective_date": "2026-01-10",
+                           "old_shares": 1, "new_shares": 2}),))
+        conn.commit()
+    finally:
+        conn.close()
+    rec = c.post("/api/announcements/G1/reconcile").json()
+    assert rec["action"] == "unchanged"
+    assert _anns_by_no(c)["G1"]["revision"] == 3
+    # 迟到的低修订同样不能覆盖
+    assert _ann(c, ann_no="G1", revision=2, effective_date="2026-01-10",
+                old_shares=1, new_shares=4).status_code == 422
